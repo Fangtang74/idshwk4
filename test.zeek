@@ -1,57 +1,28 @@
-@load base/protocols/conn
-@load base/protocols/http
+@load base/frameworks/sumstats
 
-global ip_statistic: table[addr] of table[string] of count; 
-global ip_404_sets: table[addr] of set[string]; 
-global ip_time: table[addr] of time;  
-global ip_interval: interval = 10min;
-
-global analyse: function(ip: addr);
-
-event http_begin_entity(c: connection, is_orig: bool)
-{
-	if (is_orig && c$id$orig_h !in ip_time)
-	{
-		ip_time[c$id$orig_h] = network_time();
-		ip_statistic[c$id$orig_h] = table(
-						  ["all_response"] = 0,
-						  ["404_response"] = 0
-						 );
-		ip_404_sets[c$id$orig_h] = set();
-	}	
+event http_reply(c: connection, version: string, code: count, reason: string) {
+    SumStats::observe("response", SumStats::Key($host=c$id$orig_h), SumStats::Observation($num=1));
+    if (code == 404) {
+        SumStats::observe("response404", SumStats::Key($host=c$id$orig_h), SumStats::Observation($num=1));
+        SumStats::observe("responseUnique404", SumStats::Key($host=c$id$orig_h), SumStats::Observation($str=c$http$uri));
+    }
 }
 
+event zeek_init() {
+    local r_all_response = SumStats::Reducer($stream="response", $apply=set(SumStats::SUM));
+    local r_404_response = SumStats::Reducer($stream="response404", $apply=set(SumStats::SUM));
+    local r_unique404_response = SumStats::Reducer($stream="responseUnique404", $apply=set(SumStats::UNIQUE));
 
-event http_reply(c: connection, version: string, code: count, reason: string)
-{
-	++ ip_statistic[c$id$orig_h]["all_response"];
-	
-	if (code == 404)
-	{
-		++ ip_statistic[c$id$orig_h]["404_response"];
-        	add ip_404_sets[c$id$orig_h][c$http$host + c$http$uri];
-	}
-    	
-	for (ip, time_record in ip_time)
-	{
-		if (network_time() - time_record  >= ip_interval)
-		{
-			analyse[ip];
-			ip_time[ip] = network_time();
-			ip_statistic[ip]["all_responses"] = 0;
-			ip_statistic[ip]["404_responses"] = 0;
-			ip_404_sets[ip] = set();
-		}
-	}
-	
-}
-
-
-function analyse(ip: addr)
-{
-	if (ip_statistic[ip]["404_response"] > 2 && ip_statistic[ip]["404_response"] > 0.2 * ip_statistic[ip]["all_response"] && |ip_404_sets[ip]| > 0.5 * ip_statistic[ip]["404_response"])
-	{
-		print fmt("%s is a scanner with %s attemps on %s urls", ip, ip_statistic[ip]["404_response"], |ip_404_sets[ip]|);
-	}
-
+    SumStats::create([$name="detect http scan", $epoch=10min, $reducers=set(r_all_response, r_404_response,r_unique404_response), $epoch_result(ts: time, key: SumStats::Key, result: SumStats::Result) = {
+        local r1 = result["response"];
+        local r2 = result["response404"];
+        local r3 = result["responseUnique404"];
+        if (r2$sum > 2) {
+            if (r2$sum / r1$sum > 0.2) {
+                if (r3$unique / r2$sum > 0.5) {
+                    print fmt(" %s is a scanner with %.0f scan attemps on %d urls", key$host, r2$sum, r3$unique);
+                } 
+            }
+        }
+    }]);
 }
